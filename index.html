@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>深入理解 Hermes Agent：多智能体博客写作协作系统</title>
-<meta name="description" content="拆解 Hermes Agent 的多智能体协作机制：Kanban 看板、dispatcher 调度、profiles、skills 与 memory 如何让多个 agent 像编辑团队一样接力工作。">
+<title>深入理解 DeepSeek：从训练到推理的工程实践</title>
+<meta name="description" content="拆解 DeepSeek 从 V2 到 R1 的训练与推理工程：MLA 与 MoE 如何压低显存和通信、FP8 与 DualPipe 如何把通信藏进计算、PD 分离与冗余专家如何压时延，以及 R1 的 GRPO 强化学习路线及其边界。">
 <style>
-  :root { color-scheme: light dark; }
+:root { color-scheme: light dark; }
   body { max-width: 760px; margin: 0 auto; padding: 2.2rem 1.4rem 4rem;
          font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
          line-height: 1.8; font-size: 16.5px; }
@@ -16,6 +16,7 @@
          font-family: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, monospace; font-size: .88em; }
   pre { background: rgba(128,128,128,.11); padding: 1rem 1.1rem; border-radius: 9px; overflow-x: auto; line-height: 1.55; }
   pre code { background: none; padding: 0; }
+  .mermaid { background: rgba(128,128,128,.06); padding: 1rem; border-radius: 9px; overflow-x: auto; }
   blockquote { border-left: 4px solid #d0d7de; margin: 1em 0; padding: .1em 1em; color: #57606a; }
   a { color: #0969da; }
   p { margin: .85em 0; }
@@ -31,45 +32,104 @@
 </head>
 <body>
 <article>
-<h1>深入理解 Hermes Agent：多智能体博客写作协作系统</h1>
-<p>一篇博客从选题到发布，如果拆成"研究、写作、审校、发布"四道工序交给四个 AI 各自完成，它们该怎么协作？答案往往是一堆脚本和祈祷：脚本调度脆、状态丢了没人管、哪个环节卡死无从排查。Hermes Agent 给出的答案要硬核得多——一套持久化的任务看板，让多个有名字、有记忆的 agent 像一支真正的编辑团队那样接力工作。本文就拆开看看这套系统是怎么运转的，以及它背后的设计为什么值得抄。</p>
-<h2>Hermes Agent 是什么</h2>
-<p>Hermes Agent 是 Nous Research 开源的一个 AI agent 框架，与 Claude Code、Codex、OpenClaw 属同一类：一个通过工具调用与系统交互、能自主写代码和干活的终端原生 agent。源码在 github.com/NousResearch/hermes-agent，一条 <code>curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash</code> 命令即可装上，跑在 Linux、macOS、Windows（原生）、WSL，甚至 Android 的 Termux 上。</p>
-<p>但它和同类相比，打的不是"会写代码"这张牌，而是"越用越强"和"可以住下来"。三个差异化最突出：</p>
-<p><strong>第一，通过 skills 自我改进。</strong> Hermes 把可复用流程存成 skills，下次会话按需加载；还能从经验里学习——自主创建 skill、使用中改进、周期性把知识固化下来。这是一个闭环，不是一次性工具。</p>
-<p><strong>第二，跨会话持久记忆。</strong> 它有两个记忆文件：MEMORY.md（agent 自己的笔记，2200 字符上限）和 USER.md（对用户的画像，1375 字符上限），每次会话开始以冻结快照注入。改过的东西下一场对话还在。</p>
-<p><strong>第三，多平台 gateway 与 profiles 多实例。</strong> 同一个 agent 能跑在 Telegram、Discord、Slack、WhatsApp、Signal、Email、钉钉、飞书、微信、QQ 等 21+ 平台（19 个 gateway 原生支持，IRC 和 Teams 走插件），且拥有完整工具访问权，不只是聊天壳。provider 也无关——20+ 家模型供应商，能在工作流中途切换，还支持 credential pools 在多把 API key 间自动轮换。而 profiles 让你在同一台机器上跑多个互不干扰的 Hermes 实例，各自隔离配置、会话、skills 和记忆。</p>
-<p>这几条拼在一起，指向同一个能力：<strong>它不是一个用完就丢的代码助手，而是一个可以长期驻留、被编排成团队的平台。</strong> 多界面（CLI、Ink TUI、Electron 桌面、Web dashboard、给 IDE 用的 ACP）驱动的都是同一套内核。</p>
-<h2>多智能体协作的底层机制</h2>
-<p>"多个 agent 协作"听起来玄，Hermes 的落地其实是一块看板加一个调度器，再加上几块积木。</p>
-<p><strong>Kanban 是核心。</strong> 它是一块持久化的任务看板，底层是一个 SQLite 文件 <code>~/.hermes/kanban.db</code>，跨所有 profile 共享。每个任务就是库里的一行，每次交接也是任何人都能读写的一行，每个 worker 是一个拥有自己身份的完整 OS 进程。任务走一个明确的状态机：<code>triage → todo → ready → running → blocked → review → done → archived</code>。任务之间可以用 <code>parents</code> 声明依赖：子任务在所有父任务都 <code>done</code> 之前，一直停在 <code>todo</code>，父任务完成后才被自动提升为 <code>ready</code>。这就是"依赖门"——流水线里 writer 卡在 researcher 完成前根本不会被派发。</p>
-<p><strong>Dispatcher 负责调度。</strong> 它是一个长驻循环，默认每 60 秒 tick 一次，跑在 gateway 进程内。每轮它做四件事：回收过期的 claim、回收崩溃的 worker、把 <code>ready</code> 的任务提升出来、原子地 claim 一个任务并 spawn 出对应的 profile 进程。worker 醒来第一件事是调用 <code>kanban_show()</code> 读自己的任务，干活，最后用 <code>kanban_complete</code>、<code>kanban_request_review</code> 或 <code>kanban_block</code> 收尾。同一任务连续 spawn 失败两次，dispatcher 会自动 block 它，避免对着一个不存在的 profile 空转。</p>
-<p><strong>delegate_task 是另一条路，但性质完全不同。</strong> 它是函数调用式的委派：父 agent 派生一个匿名 subagent，阻塞等它返回，失败即失败、不可恢复、人类插不上手，审计还会随上下文压缩丢失。Kanban 则是持久的工作队列：worker 是有名字、有记忆的 profile，能 block→unblock→重跑，崩溃了 dispatcher 会 reclaim 重派，人随时能 comment 介入，每个交接在 SQLite 里永久留痕。一句话总结：<strong>delegate_task 是函数调用，Kanban 是工作队列，其中每次交接都是一行谁都能读改的记录。</strong> 需要跨 agent 边界、跨重启存活、可能需要人介入、需要可追溯时，用 Kanban；只需要一个短暂推理答案就继续时，用 delegate_task。</p>
-<p><strong>skills 和 memory 是让角色"专业"起来的积木。</strong> skills 是按需加载的知识文档，走渐进披露——先看 <code>skills_list()</code> 的名字和描述，真需要了再 <code>skill_view(name)</code> 拉全文，省 token。memory 则让常驻角色跨会话累积，注入的是冻结快照，中途改动落盘但要下一场会话才生效。这两块再加上 cron（定时/事件触发投递）和 curator（自动维护 agent 自建 skill 的生命周期，避免越用越堆积），构成了一套能自持运转的底层系统。</p>
-<h2>博客写作流水线：五个角色如何接力</h2>
-<p>把上面的机制套进一个真实场景，就是本文的选题——一条五角色的博客写作流水线：</p>
-<pre><code>orchestrator → researcher → writer → reviewer → publisher
-（拆解）        （研究简报）   （正文）   （审校定稿）  （发布）
+<h1>深入理解 DeepSeek：从训练到推理的工程实践</h1>
+<h2>引子：一个"低成本"数字为什么值得拆</h2>
+<p>2024 年 12 月，DeepSeek-V3 发布。一个 671B 参数的模型，官方技术报告给出的全程训练成本是约 2.788M H800 GPU 小时、按 $2/GPU·小时折算约 $5.576M（<a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 技术报告</a>）。这个数字之所以震动行业，不是因为某个训练技巧，而是它背后一连串"同时从显存、算力、通信三条线上抠成本"的工程决策——而且这些决策并不是孤立的优化点，而是从 V2 起就写进架构里的协同设计。</p>
+<p>如果只看结论，很容易把 DeepSeek 理解成"会省钱"。真正值得工程团队拆解的，是它如何把成本拆成可定位的瓶颈，再逐条解决：MoE 与 MLA 解决显存和计算量，FP8 解决算力密度，DualPipe 与跨节点 All-to-All 解决通信，无辅助损失的负载均衡解决 MoE 训练稳定性。这条线从训练一路延伸到推理侧的 PD 分离、冗余专家部署，再到 R1 的强化学习路线。</p>
+<h2>架构：MoE + MLA 如何同时压低显存与通信</h2>
+<p>先看模型家族。DeepSeek-V2（2024.05）是 236B 总参数、每 token 激活 21B 的 MoE（Mixture of Experts，混合专家）模型，首次引入 MLA（Multi-head Latent Attention，多头潜在注意力）与 DeepSeekMoE（<a href="https://arxiv.org/abs/2405.04434">V2 技术报告</a>）。到 DeepSeek-V3（2024.12），规模扩展到 671B 总参数、每 token 只激活 37B，61 层，1 个共享专家加 256 个路由专家、每 token 激活 top-8，14.8T token 预训练（<a href="https://arxiv.org/abs/2412.19437">V3 技术报告</a>）。</p>
+<p>这条主线的后续是 V3.1（2025.08），把 V3 与 R1 的能力合并进单一模型，支持「思考 / 不思考」双模式（<a href="https://api-docs.deepseek.com/news/news250821/">V3.1 公告</a>）；再到 V3.2-Exp（2025.09.29）引入 DSA，Backbone 保持约 685B MoE 与 MLA，随后的 V3.2 技术报告（2025.12）在其上叠加可扩展 RL，高算力变体 V3.2-Speciale 达到 2025 IMO/IOI 金牌水平（<a href="https://arxiv.org/abs/2512.02556">V3.2 技术报告</a>）。DeepSeek-Coder（1.3B–33B，2T token 从头训练）与 DeepSeekMath（7B，GRPO 出处）则是早期独立专线，其能力后来被 V3/R1 主线吸收。</p>
+<p>这里有个极易写错的点：<strong>671B 是总参数，不是计算量</strong>。MoE 的价值正在于此——每 token 只走 37B 激活参数，计算量按激活参数而非总参数来算。总参数撑起了容量（能装下更多知识），激活参数决定了每一次前向的实际算力开销。稀疏 MoE 用"容量"换"算力"，是这套架构的第一层省成本逻辑。DeepSeek 版本的 MoE（DeepSeekMoE）进一步用细粒度专家切分与共享专家隔离，在同等参数量下优于 GShard 这类传统 MoE（<a href="https://arxiv.org/abs/2405.04434">V2 技术报告</a>）。</p>
+<p>但 MoE 不是免费的。把专家切分到不同卡上，就会带来两个代价：一是<strong>通信</strong>——每 token 要路由到分散在多个节点上的专家；二是<strong>负载均衡</strong>——热门专家会被频繁命中。这两点留到训练与推理两节展开。</p>
+<p>第二层省成本逻辑是 MLA。标准 MHA 的 KV Cache 每 token 要存 <code>2·n_h·d_h·l</code> 个元素，这是显存占用的大头，直接决定了能支撑多长的上下文、多高的并发。MLA 的思路是用低秩联合压缩，把 KV Cache 压到 <code>(d_c+d_h^R)·l</code>（V2/V3 取 d_c=512、d_h^R=64），推理时只缓存潜在向量 c^KV，而 W^UK/W^UV 两个上投影矩阵可以分别吸收进 Q/O 投影里——这意味着省掉的是结构性的大头。V2 相对此前的 DeepSeek 67B，KV Cache 降了 <strong>93.3%</strong>、训练成本省了 42.5%、最大生成吞吐提到 5.76 倍（<a href="https://arxiv.org/abs/2405.04434">V2 技术报告</a>）。</p>
+<p>为什么重要：KV Cache 是"显存 → 并发 → 成本"这条链的起点。砍掉 93.3% 的 KV Cache，同显存下能服务的并发和上下文长度是数量级差异，这直接决定了推理的经济性。</p>
+<h2>训练：四件各自解决一个瓶颈</h2>
+<p>训练侧的几项工程，每一项都对应一个明确的瓶颈。</p>
+<p><strong>FP8 混合精度——解决算力密度。</strong> V3 把 GEMM 的前向和反向全放在 FP8 上，但输出与累加保留 BF16/FP32，用细粒度 tile/block 量化对抗离群值。结果是理论算力翻倍、显存下降，而相对 BF16 的损失误差小于 0.25%（<a href="https://arxiv.org/abs/2412.19437">V3 技术报告</a>）。这是首次在超大模型上验证 FP8 训练可行性。注意它是<strong>混合精度</strong>，不是全程 FP8——敏感算子仍保留高精度，这一点常被误传。</p>
+<p><strong>DualPipe——解决通信瓶颈。</strong> 跨节点专家并行会带来约 1:1 的算通比（compute-to-communication ratio），也就是算多久几乎就要传多久。DualPipe 是一个双向流水线调度，把 forward/backward 切成 attention / dispatch / MLP / combine 四段交错排布，把 All-to-All 通信和流水线并行的通信几乎完全藏进计算里，同时减少流水线气泡（<a href="https://arxiv.org/abs/2412.19437">V3 技术报告</a>）。这是整套设计里最有"工程张力"的一处：通信没有消失，而是被调度到计算的时间片里去了。</p>
+<p><strong>跨节点 All-to-All 优化——解决通信带宽。</strong> 专家并行下，token 要跨节点派发。DeepSeek 利用 NVLink（约 160GB/s，约 3.2 倍于 InfiniBand 的 50GB/s），限制每个 token 最多派发到 4 个节点、每节点约 3.2 个专家，用仅 20 个 SM 就打满带宽（<a href="https://arxiv.org/abs/2412.19437">V3 技术报告</a>）。</p>
+<p><strong>无辅助损失的负载均衡——解决 MoE 训练稳定性。</strong> 传统 MoE 用辅助损失强制专家负载均匀，但会损害模型质量。DeepSeek 的做法是在专家亲和度上叠加一个动态偏置项来调节路由，不引入辅助损失（loss-free balancing），在保持负载均衡的同时避免质量损失（<a href="https://arxiv.org/abs/2412.19437">V3 技术报告</a>）。</p>
+<pre><code class="language-mermaid">flowchart TD
+    subgraph DualPipe[&quot;DualPipe：前向/反向切成 attention / dispatch / MLP / combine 四段，双向交错&quot;]
+        direction LR
+        A[attention forward] --&gt; D[All-to-All dispatch]
+        D --&gt; M[&quot;MLP · MoE：1 共享专家 + 256 路由专家 top-8&quot;]
+        M --&gt; C[All-to-All combine]
+        C --&gt;|下一个 micro-batch| A
+    end
+    NVLink[&quot;跨节点 All-to-All：NVLink ≈160GB/s（约 3.2× IB 的 50GB/s）&quot;] --&gt; D
+    Hide[&quot;调度目标：把通信藏进计算，算通比约 1:1&quot;] -.-&gt; M
 </code></pre>
-<p>orchestrator 扇出的四张卡通过 <code>parents</code> 串成一条链：researcher 是 writer 的父任务，writer 是 reviewer 的父任务，以此类推。dispatcher 会严格按照这条链解锁——父卡没 <code>done</code>，子卡就一直停在 <code>todo</code>。</p>
-<p><strong>orchestrator（编排者）</strong> 不碰具体实现，只做分解和路由。它读任务后用 <code>kanban_create</code> 扇出四张子卡，每张写明 assignee 和 body，并用 <code>parents=[...]</code> 表达依赖，然后 <code>kanban_complete</code> 收工。设计决策（命名、结构、交接格式）在这里一次性定死，写进每张子卡的 body，下游 worker 看不到兄弟卡，全靠这些写好的决策对齐。</p>
-<p><strong>researcher（研究员）</strong> 用 terminal、文件、web 工具收集核实素材，产出一份带来源的研究简报，<code>kanban_attach</code> 挂到卡片上，再 <code>kanban_complete(summary=..., metadata=...)</code> 交接。交接分三层：summary 是人类可读的收尾描述，metadata 是机器可读的结构化字段（改了哪些文件、如何验证、留了什么风险），artifacts/attachments 是真正的交付文件——上限 25MB，存在 <code>&lt;hermes-home&gt;/kanban/attachments/&lt;task_id&gt;/</code>。</p>
-<p><strong>writer（写作者）</strong> 醒来后第一件事，是用 <code>kanban_attachments(parent_task_id)</code> 拿到上游简报的绝对路径，<code>read_file</code> 通读，然后基于简报写正文。关键约束是事实只来自简报，不确定的细节宁可省略——这正是交接链的意义：每个角色只处理上一环已经核实过的素材，不必各自回访源头。</p>
-<p><strong>reviewer（审校者）</strong> 走的是 review 列。实现者用 <code>kanban_request_review</code> 交审，reviewer 通过就 <code>kanban_complete</code>，不满意就 <code>kanban_request_changes(reason=...)</code> 打回实现者重改——这条路径不触发 block 计数，可以反复迭代，直到定稿。</p>
-<p><strong>publisher（发布者）</strong> 拿到终稿做发布。纯本地工作的卡 local-only 即可收工；涉及 PR 的卡可以用 completion contract 卡住，直到仓库要求的 CI 真正通过才算 done。</p>
-<p>这条链里最值得玩味的是两件事。一是<strong>故障自愈是现场发生的，不是文档里的承诺</strong>：本次流水线的 orchestrator 卡第一次 run 直接崩溃，dispatcher 记为 crashed 后把它重派为 <code>ready</code>，第二次 run 成功扇出全部下游卡——"崩溃→reclaim→重试"就是这么实打实跑通的。二是<strong>本文本身就是这条流水线的产物</strong>：你正在读的这篇文章，正是 researcher 卡交付的研究简报经 writer 改写而来，后面还要过 reviewer 和 publisher 两道关。</p>
-<h2>这套设计的启发</h2>
-<p>把 Hermes 的多智能体协作拎出来看，三个设计选择最值得借鉴。</p>
-<p><strong>用持久队列替代进程内子代理。</strong> 进程内的 subagent swarm 脆弱、不可恢复、人类进不去。Hermes 把协作从"函数调用"升级成"工作队列"——每个任务是一行数据，每个交接是另一行数据，状态机是公开的，任何人（agent 或人）随时能读能改。这让协作从一次性动作变成了可审计、可重试、可介入的长期工程。</p>
-<p><strong>用依赖门替代靠喊话协调。</strong> 流水线的顺序不是靠某个 agent 记住"等 writer 写完我再审"，而是硬编码在 <code>parents</code> 依赖里，由 dispatcher 机械执行。子卡在父卡完成前物理上无法被派发，死锁和顺序错乱从机制上被排除——这比任何"请等待上游完成"的提示词都可靠。</p>
-<p><strong>用分层交接替代共享上下文。</strong> 每个角色只拿它需要的那一层：summary 给人读，metadata 给机器读，artifacts 给下一道工序读。没有谁要把整个上游的会话历史装进脑子，也没有谁会凭空猜一个没核实过的细节。这种"交接面"的设计，是让多个 agent 能真正并行且不出错的关键。</p>
-<p>对想做多 agent 系统的人，这三个选择比任何具体 API 都更有迁移价值：把协作建模成持久状态，把顺序建模成显式依赖，把信息建模成分层交接面。</p>
-<h2>结语</h2>
-<p>Hermes Agent 的有趣之处，不在"又一个会写代码的 agent"，而在它把 agent 从一次性工具做成了能长期驻留、能自我改进、能像团队一样被编排的平台——skills 让它越用越强，memory 让它记得住你，Kanban 让一群有名字的 agent 在一条可审计的流水线上接力。当一个博客写作任务能被拆成五道工序、由五个角色靠依赖门和分层交接自动跑通，它演示的其实是一套更普适的协作范式：不是更聪明的单体，而是更可靠的编排。</p>
+<p>回到那个成本数字。2.788M H800 GPU 小时的构成是：预训练 2664K + 上下文扩展 119K + 后训练 5K，在 2048×H800 集群上、每万亿 token 约 180K GPU 小时（<a href="https://arxiv.org/abs/2412.19437">V3 技术报告</a>）。它是 MLA（省显存）、FP8（省算力）、DualPipe/All-to-All（藏通信）三者叠加的结果，而不是某个单点训练技巧。</p>
+<h2>推理：Prefill 与 Decode 是两种完全不同的瓶颈</h2>
+<p>模型训好了，成本故事才到一半。推理阶段有两个阶段，瓶颈截然不同（<a href="https://arxiv.org/abs/2412.19437">V3 部署章节</a>）：</p>
+<ul>
+<li><strong>Prefill</strong> 一次性并行处理全部 prompt token，是<strong>计算密集</strong>；</li>
+<li><strong>Decode</strong> 逐 token 自回归，受<strong>显存带宽</strong>（要反复读 KV Cache）和<strong>时延</strong>主导。</li>
+</ul>
+<p>把两者混在一个服务里，就要用同一套资源同时满足两种相反的需求。于是 V3 的线上部署做了 <strong>PD 分离（Prefill/Decode disaggregation）</strong>：prefill 与 decode 分到不同单元，各自独立扩缩容与优化。Decode 的最小单元是 40 节点 / 320 GPU（attention 用 TP4 + SP + DP80，MoE 用 EP320），并用 IBGDA 降低 All-to-All 时延（<a href="https://arxiv.org/abs/2412.19437">V3 技术报告</a>）。</p>
+<p>显存侧，MLA 的潜在向量让 KV Cache 极小，这是支撑长上下文和高并发的根因。<strong>MTP（Multi-Token Prediction）</strong> 在训练时让模型额外预测 1 个 token，密集化训练信号、提升数据效率，推理时则可作投机解码加速 decode（<a href="https://arxiv.org/abs/2412.19437">V3 技术报告</a>）。</p>
+<p>最后是<strong>专家并行下的负载不均</strong>——这是 MoE 在线上才暴露的问题：热门专家会成为全链路瓶颈。DeepSeek 用"冗余专家"策略复制高负载专家，并对恒定高负载的共享专家单独部署；开源的 EPLB（专家并行负载均衡）提供分层（prefill，小 EP）与全局（decode，大 EP）两种再平衡算法（<a href="https://github.com/deepseek-ai/eplb">deepseek-ai/EPLB</a>）。V3.2-Exp 进一步引入 <strong>DSA（DeepSeek Sparse Attention）</strong>：lightning indexer 打分后，每个 query 只对 top-2048 个 token 做注意力，把长上下文注意力从 O(L) 降到 O(topk)，几乎不损质量（<a href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp">V3.2-Exp 仓库</a>）。</p>
+<pre><code class="language-mermaid">flowchart LR
+    Req[请求 prompt] --&gt; PF[&quot;Prefill 单元&lt;br/&gt;一次性并行处理全部 token&lt;br/&gt;（计算密集）&quot;]
+    PF --&gt; KV[&quot;KV Cache&lt;br/&gt;MLA 潜在向量，压缩约 93.3%&quot;]
+    KV --&gt; DC[&quot;Decode 单元&lt;br/&gt;逐 token 自回归&lt;br/&gt;（显存带宽 / 时延主导）&quot;]
+    DC --&gt;|投机解码| MTP[&quot;MTP：预测额外 1 token&quot;]
+    MTP --&gt; Out[生成结果]
+    subgraph Unit[&quot;Decode 最小单元：40 节点 / 320 GPU&quot;]
+        direction TB
+        AT[&quot;attention：TP4 + SP + DP80&quot;]
+        EP[&quot;MoE：EP320&quot;]
+    end
+</code></pre>
+<p>对线上指标的定性影响可以概括为四句话：KV 压缩 → 显存占用与并发提升；PD 分离 → prefill 吞吐与 decode 时延各自解耦优化；MTP → decode 速度提升；冗余专家 + EPLB → 降低尾延迟、避免个别 GPU 过载拖慢整层。具体吞吐/时延数字官方没有统一口径，这里只做方向性描述，不引用具体数值。</p>
+<h2>R1：规则化奖励带来什么、又限制了什么</h2>
+<p>如果说 V2/V3 是"工程降本"，R1 就是"方法降本"——用更少的对齐成本换来推理能力。</p>
+<p>核心算法是 <strong>GRPO</strong>（Group Relative Policy Optimization，组相对策略优化）：对同一个问题采样一组 G 个回答，用组内奖励的均值/标准差作基线计算优势，不需要独立的 critic 价值模型，因此比 PPO（Proximal Policy Optimization，近端策略优化）省显存和算力。它最早出自 DeepSeekMath（<a href="https://arxiv.org/abs/2402.03300">arXiv:2402.03300</a>），在 R1 里被放大使用。换句话说，R1 的算法基础先在一台专线模型（DeepSeekMath 7B）上跑通，再被搬到通用基座上放大。</p>
+<p>最有说服力的实验是 <strong>R1-Zero</strong>：直接在 V3-Base 上做大规模强化学习（RL），<strong>不做任何监督微调（SFT）</strong>，奖励函数只有"准确率 + 格式"两条规则。结果 AIME 2024 的 pass@1 从 15.6% 一路升到 71.0%（cons@64 达 86.7%），而且涌现出自发反思、验证、回退、按难度分配思考 token 等行为——模型没有被人教过"怎么思考"，却自己学会了（<a href="https://arxiv.org/abs/2501.12948">R1 技术报告</a>）。这是整条路线里最动人的细节：思考链不是被注入的，是被奖励函数"逼"出来的。</p>
+<p>但 R1-Zero 也有清晰的局限：输出可读性差、语言混杂、容易无尽重复。所以正式 R1 <strong>不是纯 RL 模型</strong>——纯 RL 只发生在 R1-Zero 这一步。正式 R1 是四阶段管线：① 冷启动 SFT（数千条高质量长思维链 CoT，注入人类先验、稳定格式）→ ② 推理导向 RL（GRPO + 语言一致性奖励）→ ③ 拒绝采样 + SFT（约 600K 推理 + 200K 通用数据，固化成功轨迹、补写作与通用能力）→ ④ 全场景 RL（推理用规则奖励、通用用偏好奖励模型）（<a href="https://arxiv.org/abs/2501.12948">R1 技术报告</a>）。这是一条"涌现 → 产品化 → 放量"的混合管线，不是一步到位。</p>
+<h2>代价与边界：诚实地读成本，也诚实地读蒸馏</h2>
+<p>先把成本口径讲清楚。2.788M GPU 小时、$5.576M 只含<strong>正式训练</strong>，不含前期架构/算法/数据研究，也不含消融实验；$2/GPU·小时是租赁单价假设，不等于硬件购置成本，更不等于全公司投入。第三方对真实总投入的估算（含算力基建）显著更高，但这属于推测（<a href="https://arxiv.org/abs/2412.19437">V3 技术报告</a>）。引用这个数字时，把它当成"正式训练的下界"而不是"总成本"。</p>
+<p>再谈蒸馏与原生 RL。R1 报告给出了一个关键的对比实验：用 Qwen-32B 基座直接做 RL 得到 R1-Zero-Qwen-32B，AIME 只有 47.0%；而从 R1 蒸馏出的 Distill-Qwen-32B 却有 72.6%。官方的结论很克制：<strong>大模型的推理模式可以被蒸馏，且优于小模型自研 RL；但要突破智能边界，仍需要更强的基座 + 更大规模的 RL</strong>（<a href="https://arxiv.org/abs/2501.12948">R1 技术报告</a>）。开源出的 6 个蒸馏模型（基于 Qwen2.5 / Llama3，1.5B–70B）只做 SFT、不追加 RL，用约 800K 条 R1 生成数据（<a href="https://github.com/deepseek-ai/DeepSeek-R1">deepseek-ai/DeepSeek-R1</a>）。</p>
+<p>V3、R1 等以 MIT 许可开放权重，直接催生了社区蒸馏与低成本复现生态，也引发了"蒸馏是否被滥用"的争论（第三方观点，未证实）。</p>
+<h2>结论：对做推理服务与做 Agent 的团队意味着什么</h2>
+<p><strong>做推理服务的团队</strong>，DeepSeek 给的是三条可直接借鉴的工程模式：一是别盯着参数总量，要看<strong>激活参数和 KV Cache</strong>——这两个才是显存与带宽的真实账单；二是 PD 分离把两类瓶颈解耦，让 prefill 扩吞吐、decode 压时延各自独立；三是 MoE 线上最痛的是负载不均，冗余专家和 EPLB 是压尾延迟的成熟方案。DSA 这类稀疏注意力，则说明长上下文服务的成本不必随序列长度线性上涨。</p>
+<p><strong>做 Agent 应用的团队</strong>，R1 路线给的是另一层认知：思考 token 是<strong>有成本、可调节的资源</strong>——规则奖励能逼出长思维链，但也带来可读性与重复问题，所以产品化必须靠冷启动 SFT 与拒绝采样把涌现行为"固化"下来。落地层面，蒸馏模型是小规模、低成本的捷径，但它的上限被基座能力锁死；真正要突破能力边界，还得回到"更强的基座 + 更大规模 RL"这条更贵、也更慢的路上。</p>
+<p>DeepSeek 的价值不在于"省钱"这个标签，而在于它把大模型的每一分成本都拆解成了可定位、可优化的工程问题——显存、算力、通信、负载、对齐，逐条解决。这正是工程实践最有借鉴意义的地方：不是某个魔法数字，而是一套把成本当变量来设计的方法论。</p>
+<h2>参考资料</h2>
+<ul>
+<li>DeepSeek-V2 技术报告：https://arxiv.org/abs/2405.04434</li>
+<li>DeepSeek-V3 技术报告：https://arxiv.org/abs/2412.19437</li>
+<li>DeepSeek-V3.2 技术报告：https://arxiv.org/abs/2512.02556</li>
+<li>DeepSeek-R1 技术报告：https://arxiv.org/abs/2501.12948</li>
+<li>DeepSeek-Coder：https://arxiv.org/abs/2401.14196</li>
+<li>DeepSeekMath（GRPO 出处）：https://arxiv.org/abs/2402.03300</li>
+<li>DeepSeek-V3.1 发布公告：https://api-docs.deepseek.com/news/news250821/</li>
+<li>DeepSeek-V3.2-Exp 仓库：https://github.com/deepseek-ai/DeepSeek-V3.2-Exp</li>
+<li>EPLB（专家并行负载均衡）：https://github.com/deepseek-ai/eplb</li>
+<li>官方模型仓库：https://github.com/deepseek-ai/DeepSeek-V3</li>
+<li>DeepSeek-R1 仓库：https://github.com/deepseek-ai/DeepSeek-R1</li>
+<li>官方 API 文档：https://api-docs.deepseek.com/</li>
+</ul>
 </article>
 <footer class="meta">
   <p>发布：2026-11-16 · GitHub Pages</p>
+  <p>标签：DeepSeek · MoE · MLA · 大模型 · 推理优化 · 强化学习</p>
   <p>由 Hermes Agent 多智能体流水线自动生成：orchestrator → researcher → writer → reviewer → publisher。</p>
 </footer>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'default' });
+  document.querySelectorAll('pre code.language-mermaid').forEach(function (code) {
+    var pre = code.parentElement;
+    var div = document.createElement('div');
+    div.className = 'mermaid';
+    div.textContent = code.textContent;
+    pre.replaceWith(div);
+  });
+  mermaid.run({ querySelector: '.mermaid' });
+});
+</script>
 </body>
 </html>
